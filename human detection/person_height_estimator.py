@@ -2,29 +2,33 @@ import torch
 import cv2
 from PIL import Image
 
-def estimate_person_height(caps, known_distance=2.0, known_height=1.7):
+def estimate_person_height(camera_indices=[0], known_distance=2.0, known_height=1.7):
     # Model
     model = torch.hub.load("ultralytics/yolov5", "yolov5s")
 
-    # Allow the cameras to initialize
-    for cap in caps:
-        cv2.waitKey(1000)  # 1-second delay
+    # Create cv2.VideoCapture objects for each camera index
+    caps = [cv2.VideoCapture(index) for index in camera_indices]
 
-    # Create separate windows for each camera
-    window_names = [f"Camera {i}" for i in range(len(caps))]
-    for window_name in window_names:
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(window_name, 800, 600)
+    # Create windows for each camera
+    window_names = [f"Camera {index} Feed" for index in camera_indices]
+    for name in window_names:
+        cv2.namedWindow(name, cv2.WINDOW_NORMAL)
 
     while True:
-        frames = [cap.read()[1] for cap in caps]
+        for cap, window_name in zip(caps, window_names):
+            # Check if the camera is opened successfully
+            if not cap.isOpened():
+                print(f"Error: Unable to open camera.")
+                continue
 
-        # Check if the frames are read successfully
-        if any(frame is None for frame in frames):
-            print("Error: Unable to read frames from one of the cameras.")
-            break
+            # Read a frame from the camera
+            ret, frame = cap.read()
 
-        for i, (cap, frame) in enumerate(zip(caps, frames)):
+            # Check if the frame is read successfully
+            if not ret:
+                print(f"Error: Unable to read a frame from the camera.")
+                break
+
             # Convert the frame to PIL Image
             pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
@@ -43,6 +47,7 @@ def estimate_person_height(caps, known_distance=2.0, known_height=1.7):
                 cv2.rectangle(frame, (int(x), int(y)), (int(x1), int(y1)), (0, 255, 0), 2)
 
                 # Calculate the distance from the camera to the person
+                # Assuming a simple perspective model (not considering lens distortion)
                 focal_length = (frame.shape[1] * known_distance) / known_height
                 distance = (known_height * focal_length) / (y1 - y)
 
@@ -54,8 +59,12 @@ def estimate_person_height(caps, known_distance=2.0, known_height=1.7):
                 # Draw label
                 cv2.putText(frame, label, (int(x), int(y) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-            # Display the original frame with bounding boxes and labels in the respective window
-            cv2.imshow(window_names[i], frame)
+            # Display the original frame with bounding boxes and labels
+            cv2.imshow(window_name, frame)
+
+            # Set a larger window size for the first camera (index 0)
+            if window_name == window_names[0]:
+                cv2.resizeWindow(window_name, 800, 600)
 
         # Break the loop if 'q' key is pressed
         if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -68,8 +77,4 @@ def estimate_person_height(caps, known_distance=2.0, known_height=1.7):
 
 if __name__ == "__main__":
     # If you run this script directly, execute the function with default values
-    # Replace the camera_indices parameter with the actual camera indices
-    cap_1 = cv2.VideoCapture(0)
-    cap_2 = cv2.VideoCapture(1)
-
-    estimate_person_height(caps=[cap_1, cap_2], known_distance=2.0, known_height=1.7)
+    estimate_person_height(camera_indices=[0, 1])
