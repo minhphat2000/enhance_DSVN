@@ -1,3 +1,4 @@
+#https://docs.google.com/document/d/1H_g7rkVEsXc6SeP22CpMppED-EIbIcujrkgOogyqyUY/edit?usp=sharing
 import torch
 
 # Model
