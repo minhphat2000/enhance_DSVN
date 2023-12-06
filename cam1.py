@@ -1,75 +1,147 @@
-import torch
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 import cv2
-from PIL import Image
+import numpy as np
+import tensorflow as tf
+from yolov3.utils import Load_Yolo_model, image_preprocess, postprocess_boxes, nms, draw_bbox, read_class_names
+from yolov3.configs import *
+import time
 
-def estimate_person_height(known_distance=2.0, known_height=1.7):
-    # Model
-    model = torch.hub.load("ultralytics/yolov5", "yolov5s")
+from deep_sort import nn_matching
+from deep_sort.detection import Detection
+from deep_sort.tracker import Tracker
+from deep_sort import generate_detections as gdet
 
-    # Create cv2.VideoCapture object for the camera
-    cap = cv2.VideoCapture(1)
+video_path = ""
 
-    # Create window for the camera
-    cv2.namedWindow("Camera Feed", cv2.WINDOW_NORMAL)
+def Object_tracking(Yolo, video_path, output_path, input_size=416, show=False, CLASSES=YOLO_COCO_CLASSES, score_threshold=0.3, iou_threshold=0.45, rectangle_colors='', Track_only=[]):
+    # Definition of the parameters
+    max_cosine_distance = 0.7
+    nn_budget = None
+    
+    # initialize deep sort object
+    model_filename = 'model_data/mars-small128.pb'
+    encoder = gdet.create_box_encoder(model_filename, batch_size=1)
+    metric = nn_matching.NearestNeighborDistanceMetric("cosine", max_cosine_distance, nn_budget)
+    tracker = Tracker(metric)
 
+    times, times_2 = [], []
+
+    if video_path:
+        vid = cv2.VideoCapture(video_path)  # detect on video
+    else:
+        vid = cv2.VideoCapture(0)  # detect from webcam
+
+    # by default VideoCapture returns float instead of int
+    width = int(vid.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(vid.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = int(vid.get(cv2.CAP_PROP_FPS))
+    codec = cv2.VideoWriter_fourcc(*'XVID')
+    out = cv2.VideoWriter(output_path, codec, 140, (width, height))  # output_path must be .mp4
+
+    NUM_CLASS = read_class_names(CLASSES)
+    key_list = list(NUM_CLASS.keys())
+    val_list = list(NUM_CLASS.values())
+    frame_time = 1.0 / 140.0  # Target FPS is 30
     while True:
-        # Check if the camera is opened successfully
-        if not cap.isOpened():
-            print(f"Error: Unable to open camera.")
+        _, frame = vid.read()
+
+        try:
+            original_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            original_frame = cv2.cvtColor(original_frame, cv2.COLOR_BGR2RGB)    
+            fps = int(vid.get(cv2.CAP_PROP_FPS))
+
+        except:
             break
 
-        # Read a frame from the camera
-        ret, frame = cap.read()
+        image_data = image_preprocess(np.copy(original_frame), [input_size, input_size])
+        image_data = image_data[np.newaxis, ...].astype(np.float32)
 
-        # Check if the frame is read successfully
-        if not ret:
-            print(f"Error: Unable to read a frame from the camera.")
-            break
+        t1 = time.time()
+        if YOLO_FRAMEWORK == "tf":
+            pred_bbox = Yolo.predict(image_data)
+        elif YOLO_FRAMEWORK == "trt":
+            batched_input = tf.constant(image_data)
+            result = Yolo(batched_input)
+            pred_bbox = []
+            for key, value in result.items():
+                value = value.numpy()
+                pred_bbox.append(value)
 
-        # Convert the frame to PIL Image
-        pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        t2 = time.time()
 
-        # Inference
-        results = model(pil_image)
+        pred_bbox = [tf.reshape(x, (-1, tf.shape(x)[-1])) for x in pred_bbox]
+        pred_bbox = tf.concat(pred_bbox, axis=0)
 
-        # Get class labels and bounding boxes for persons (class 0 in COCO dataset)
-        persons = [obj for obj in results.xyxy[0] if int(obj[-1]) == 0]
+        bboxes = postprocess_boxes(pred_bbox, original_frame, input_size, score_threshold)
+        bboxes = nms(bboxes, iou_threshold, method='nms')
 
-        # Draw bounding boxes and labels on the frame
-        for person in persons:
-            x, y, x1, y1, conf, class_id = person
-            label = f"Person: {conf:.2f}"
+        # extract bboxes to boxes (x, y, width, height), scores and names
+        boxes, scores, names = [], [], []
+        for bbox in bboxes:
+            if len(Track_only) != 0 and NUM_CLASS[int(bbox[5])] in Track_only or len(Track_only) == 0:
+                boxes.append([bbox[0].astype(int), bbox[1].astype(int), bbox[2].astype(int)-bbox[0].astype(int),
+                              bbox[3].astype(int)-bbox[1].astype(int)])
+                scores.append(bbox[4])
+                names.append(NUM_CLASS[int(bbox[5])])
 
-            # Draw bounding box
-            cv2.rectangle(frame, (int(x), int(y)), (int(x1), int(y1)), (0, 255, 0), 2)
+        # Obtain all the detections for the given frame.
+        boxes = np.array(boxes)
+        names = np.array(names)
+        scores = np.array(scores)
+        features = np.array(encoder(original_frame, boxes))
+        detections = [Detection(bbox, score, class_name, feature) for bbox, score, class_name, feature in
+                      zip(boxes, scores, names, features)]
 
-            # Calculate the distance from the camera to the person
-            # Assuming a simple perspective model (not considering lens distortion)
-            focal_length = (frame.shape[1] * known_distance) / known_height
-            distance = (known_height * focal_length) / (y1 - y)
+        # Pass detections to the deepsort object and obtain the track information.
+        tracker.predict()
+        tracker.update(detections)
 
-            # Draw estimated height on the frame
-            estimated_height = known_height * frame.shape[1] / (y1 - y)
-            height_label = f"Height: {estimated_height:.2f} meters"
-            cv2.putText(frame, height_label, (int(x), int(y) - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+        # Obtain info from the tracks
+        tracked_bboxes = []
+        for track in tracker.tracks:
+            if not track.is_confirmed() or track.time_since_update > 5:
+                continue
+            bbox = track.to_tlbr()  # Get the corrected/predicted bounding box
+            class_name = track.get_class()  # Get the class name of a particular object
+            tracking_id = track.track_id  # Get the ID for the particular track
+            index = key_list[val_list.index(
+                class_name)]  # Get predicted object index by object name
+            tracked_bboxes.append(
+                bbox.tolist() + [tracking_id, index])  # Structure data, that we could use it with our draw_bbox function
 
-            # Draw label
-            cv2.putText(frame, label, (int(x), int(y) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        # draw detection on frame
+        image = draw_bbox(original_frame, tracked_bboxes, CLASSES=CLASSES, tracking=True)
 
-        # Display the original frame with bounding boxes and labels
-        cv2.imshow("Camera Feed", frame)
+        t3 = time.time()
+        times.append(t2-t1)
+        times_2.append(t3-t1)
 
-        # Set a larger window size
-        cv2.resizeWindow("Camera Feed", 800, 600)
+        times = times[-20:]
+        times_2 = times_2[-20:]
 
-        # Break the loop if 'q' key is pressed
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+        ms = sum(times)/len(times)*1000
+        fps = 1000 / ms
+        fps2 = 1000 / (sum(times_2)/len(times_2)*1000)
 
-    # Release the camera and close the window
-    cap.release()
+        image = cv2.putText(image, "Time: {:.1f} FPS".format(fps), (0, 30),
+                            cv2.FONT_HERSHEY_COMPLEX_SMALL, 1, (0, 0, 255), 2)
+
+        print("Time: {:.2f}ms, Detection FPS: {:.1f}, total FPS: {:.1f}".format(ms, fps, fps2))
+        if output_path != '':
+            out.write(image)
+        if show:
+            cv2.imshow('output', image)
+
+            if cv2.waitKey(25) & 0xFF == ord("q"):
+                cv2.destroyAllWindows()
+                break
+            # Add a delay to achieve the target FPS
+            time.sleep(max(0, frame_time - (time.time() - t3)))
+
     cv2.destroyAllWindows()
 
-if __name__ == "__main__":
-    # If you run this script directly, execute the function with default values
-    estimate_person_height()
+
+yolo = Load_Yolo_model()
+Object_tracking(yolo, video_path, "detection.mp4", input_size=YOLO_INPUT_SIZE, show=True, iou_threshold=0.1,
+                rectangle_colors=(255, 0, 0), Track_only=["person"])
