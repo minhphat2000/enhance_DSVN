@@ -1,5 +1,6 @@
 #https://docs.google.com/document/d/1H_g7rkVEsXc6SeP22CpMppED-EIbIcujrkgOogyqyUY/edit?usp=sharing
 #https://drive.google.com/file/d/1_HUqV5bVuOdl8WwTh4wOIPi3x_CRX1Hs/view?usp=sharing
+#https://github.com/DoranLyong/yolov4-tiny-tflite-for-person-detection/tree/main
 import torch
 
 # Model
